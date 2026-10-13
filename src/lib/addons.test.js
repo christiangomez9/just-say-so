@@ -177,10 +177,63 @@ describe('extractGhTexts', () => {
       expect(out.payloads).toEqual([{ label: '-F body', text: 'from the file' }]);
     });
 
-    it('should mark --input unresolved', () => {
-      const out = extractGhTexts('gh api -X POST repos/o/r/issues --input req.json');
-      expect(out.unresolved).toEqual([
-        { label: '--input', reason: 'request body from a file the checker does not parse' }
+    it('should match a nested field key by its last bracketed segment', () => {
+      const out = extractGhTexts(
+        "gh api repos/o/r/pulls/7/reviews -f 'comments[][body]=nested words' -f 'comments[][path]=a.md' -f event=COMMENT"
+      );
+      expect(out.payloads).toEqual([{ label: '-f comments[][body]', text: 'nested words' }]);
+    });
+  });
+
+  describe('when the command is gh api with --input', () => {
+    const review = JSON.stringify({
+      event: 'COMMENT',
+      body: 'summary words',
+      comments: [
+        { path: 'README.md', line: 1, side: 'RIGHT', body: 'first comment' },
+        { path: 'README.md', line: 9, body: 'second comment', meta: { title: 'deep title' } }
+      ]
+    });
+
+    it('should lint every prose key in the JSON body, labeled by its path', () => {
+      const readFile = () => review;
+      const out = extractGhTexts('gh api --method POST repos/o/r/pulls/7/reviews --input review.json', { readFile });
+      expect(out).toEqual({
+        target: 'gh api',
+        payloads: [
+          { label: '--input body', text: 'summary words' },
+          { label: '--input comments[0].body', text: 'first comment' },
+          { label: '--input comments[1].body', text: 'second comment' },
+          { label: '--input comments[1].meta.title', text: 'deep title' }
+        ],
+        unresolved: []
+      });
+    });
+
+    it('should read the =-joined form and a body with no prose keys', () => {
+      const readFile = () => '{"state":"closed","labels":["bug"]}';
+      const out = extractGhTexts('gh api -X PATCH repos/o/r/issues/3 --input=req.json', { readFile });
+      expect(out).toEqual({ target: 'gh api', payloads: [], unresolved: [] });
+    });
+
+    it('should mark stdin, an unreadable file, a non-JSON file, and an expanded path unresolved', () => {
+      const readFile = (p) => {
+        if (p === 'text.md') return 'not json';
+        throw new Error('ENOENT');
+      };
+      const cases = [
+        'gh api repos/o/r/issues --input -',
+        'gh api repos/o/r/issues --input missing.json',
+        'gh api repos/o/r/issues --input text.md',
+        'gh api repos/o/r/issues --input "$FILE"',
+        'gh api repos/o/r/issues --input'
+      ].map((c) => extractGhTexts(c, { readFile }).unresolved);
+      expect(cases).toEqual([
+        [{ label: '--input', reason: 'reads stdin' }],
+        [{ label: '--input', reason: 'cannot read missing.json' }],
+        [{ label: '--input', reason: 'text.md is not JSON' }],
+        [{ label: '--input', reason: 'shell expansion in the file path' }],
+        [{ label: '--input', reason: 'missing value' }]
       ]);
     });
   });

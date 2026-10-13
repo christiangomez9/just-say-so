@@ -35,6 +35,30 @@ const FILE_FLAGS = {
 const API_FIELD_FLAGS = new Set(['-f', '-F', '--field', '--raw-field']);
 const API_PROSE_KEYS = new Set(['body', 'title', 'description', 'notes']);
 
+// A nested field key such as `comments[][body]` names its leaf in the last
+// bracketed segment; a plain key is its own leaf.
+function isProseKey(key) {
+  const segments = [...key.matchAll(/\[([^\]]*)\]/g)].map((m) => m[1]);
+  const leaf = segments.length > 0 ? segments[segments.length - 1] : key;
+  return API_PROSE_KEYS.has(leaf);
+}
+
+// Every string under a prose key in a parsed request body, at any depth,
+// each labeled with its JSON path (`comments[3].body`) so an alert names
+// the comment it sits in.
+function proseStringsIn(value, at, out) {
+  if (Array.isArray(value)) {
+    value.forEach((item, i) => proseStringsIn(item, `${at}[${i}]`, out));
+  } else if (value !== null && typeof value === 'object') {
+    for (const [key, child] of Object.entries(value)) {
+      const here = at ? `${at}.${key}` : key;
+      if (typeof child === 'string' && API_PROSE_KEYS.has(key)) out.push({ path: here, text: child });
+      else proseStringsIn(child, here, out);
+    }
+  }
+  return out;
+}
+
 const SEPARATOR = /^[;&|]+$/;
 
 /**
@@ -169,6 +193,38 @@ export function extractGhTexts(command, { readFile } = {}) {
     }
   };
 
+  // A `gh api --input` body is JSON the checker can walk. A review with
+  // inline comments has to travel this way, so the prose keys inside it
+  // get the same check as a -f field. Stdin, an unreadable file, and a
+  // body that is not JSON stay unresolved: the extractor still never guesses.
+  const requestBody = (token) => {
+    if (token.unsafe) {
+      unresolved.push({ label: '--input', reason: 'shell expansion in the file path' });
+      return;
+    }
+    if (token.value === '-') {
+      unresolved.push({ label: '--input', reason: 'reads stdin' });
+      return;
+    }
+    let text;
+    try {
+      text = read(token.value);
+    } catch {
+      unresolved.push({ label: '--input', reason: `cannot read ${token.value}` });
+      return;
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      unresolved.push({ label: '--input', reason: `${token.value} is not JSON` });
+      return;
+    }
+    for (const { path: at, text: value } of proseStringsIn(parsed, '', [])) {
+      payloads.push({ label: `--input ${at}`, text: value });
+    }
+  };
+
   for (let i = 0; i < tokens.length; i++) {
     if (tokens[i].value !== 'gh' || tokens[i].unsafe) continue;
     const a = tokens[i + 1]?.value;
@@ -191,8 +247,12 @@ export function extractGhTexts(command, { readFile } = {}) {
 
       if (isApi) {
         if (flag === '--input') {
-          unresolved.push({ label: '--input', reason: 'request body from a file the checker does not parse' });
+          if (!valueToken) {
+            unresolved.push({ label: '--input', reason: 'missing value' });
+            continue;
+          }
           if (!inline) j++;
+          requestBody(valueToken);
           continue;
         }
         if (!API_FIELD_FLAGS.has(flag)) continue;
@@ -201,7 +261,7 @@ export function extractGhTexts(command, { readFile } = {}) {
         const eq = valueToken.value.indexOf('=');
         if (eq <= 0) continue;
         const key = valueToken.value.slice(0, eq);
-        if (!API_PROSE_KEYS.has(key)) continue;
+        if (!isProseKey(key)) continue;
         const label = `${flag} ${key}`;
         const rest = valueToken.value.slice(eq + 1);
         if (flag === '-F' && rest.startsWith('@')) {
