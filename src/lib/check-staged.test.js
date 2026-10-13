@@ -2,7 +2,9 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import {
+  runStagedCheck,
   parseAddedLines,
   isWholeFileRule,
   fileLevelRules,
@@ -158,5 +160,166 @@ describe('selectAlerts', () => {
     const { kept, unmapped } = selectAlerts(alerts, null, new Set());
     expect(kept.get('a.md')).toHaveLength(2);
     expect(unmapped).toEqual([]);
+  });
+});
+
+// runStagedCheck drives git and vale as child processes, so these cases run
+// against a real temporary repository and a vale stand-in on PATH. The
+// stand-in answers `ls-dirs` (the probe) and reports an error alert on
+// every line of the named file that contains "forbidden", with that
+// line's number, which is the number the line filter must match.
+describe('runStagedCheck', () => {
+  let repo, env;
+
+  const sh = (args) => {
+    const r = spawnSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args], {
+      cwd: repo,
+      encoding: 'utf8'
+    });
+    if (r.status !== 0) throw new Error(r.stderr);
+    return r.stdout;
+  };
+  const write = (rel, text) => fs.writeFileSync(path.join(repo, rel), text);
+  const errorLines = (result) =>
+    result.report
+      .split('\n')
+      .filter((l) => l.includes('Test.Banned'))
+      .map((l) => parseInt(/L(\d+):/.exec(l)[1], 10));
+
+  beforeEach(() => {
+    repo = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'jss-repo-')));
+    const bin = path.join(repo, '.bin');
+    fs.mkdirSync(bin);
+    const fake = path.join(bin, 'vale');
+    fs.writeFileSync(
+      fake,
+      [
+        '#!/usr/bin/env node',
+        "const fs = require('node:fs');",
+        'const args = process.argv.slice(2);',
+        "if (args[0] === 'ls-dirs') process.exit(0);",
+        'const file = args[args.length - 1];',
+        "const lines = fs.readFileSync(file, 'utf8').split('\\n');",
+        'const alerts = [];',
+        'lines.forEach((text, i) => {',
+        "  const col = text.indexOf('forbidden');",
+        '  if (col === -1) return;',
+        "  alerts.push({ Check: 'Test.Banned', Severity: 'error', Line: i + 1, Span: [col + 1, col + 9],",
+        "    Match: 'forbidden', Message: 'banned' });",
+        '});',
+        'process.stdout.write(JSON.stringify(alerts.length ? { [file]: alerts } : {}));',
+        'process.exit(alerts.length ? 1 : 0);'
+      ].join('\n')
+    );
+    fs.chmodSync(fake, 0o755);
+    // The developer's own config layers and skip flag must not reach the gate.
+    env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}` };
+    env.JUST_SAY_SO_CONFIG = path.join(repo, 'no-such-config.json');
+    delete env.JUST_SAY_SO_FORCE_CONFIG;
+    delete env.JUST_SAY_SO_PRECOMMIT;
+
+    sh(['init', '-q', '-b', 'main']);
+    write('.vale.ini', 'StylesPath = styles\n\n[*.md]\nBasedOnStyles = Test\n');
+    write('.gitignore', '.bin\n');
+    write('doc.md', '# Doc\n\nClean.\n');
+    sh(['add', '-A']);
+    sh(['commit', '-qm', 'base']);
+    sh(['checkout', '-qb', 'feature']);
+    write('doc.md', '# Doc\n\nClean.\n\nA forbidden line the branch committed.\n');
+    sh(['commit', '-qam', 'add an error']);
+  });
+
+  afterEach(() => {
+    fs.rmSync(repo, { recursive: true, force: true });
+  });
+
+  describe('in --base mode', () => {
+    describe('when the working tree matches HEAD', () => {
+      let result;
+
+      beforeEach(() => {
+        result = runStagedCheck({ base: 'main', cwd: repo, env });
+      });
+
+      it('should fail on the committed error at its line', () => {
+        expect(result.exitCode).toBe(1);
+        expect(errorLines(result)).toEqual([5]);
+      });
+    });
+
+    describe('when uncommitted lines sit above the committed error', () => {
+      let result;
+
+      beforeEach(() => {
+        write('doc.md', 'An uncommitted line.\n\n# Doc\n\nClean.\n\nA forbidden line the branch committed.\n');
+        result = runStagedCheck({ base: 'main', cwd: repo, env });
+      });
+
+      it('should still fail, at the working-tree line', () => {
+        expect(result.exitCode).toBe(1);
+        expect(errorLines(result)).toEqual([7]);
+      });
+    });
+
+    describe('when the base is HEAD and an uncommitted line has the error', () => {
+      let result;
+
+      beforeEach(() => {
+        write('doc.md', '# Doc\n\nClean.\n\nA forbidden line the branch committed.\n\nAnother forbidden line, uncommitted.\n');
+        result = runStagedCheck({ base: 'HEAD', cwd: repo, env });
+      });
+
+      it('should report only the uncommitted line', () => {
+        expect(result.exitCode).toBe(1);
+        expect(errorLines(result)).toEqual([7]);
+      });
+    });
+
+    describe('when an untracked prose file has an error', () => {
+      let result;
+
+      beforeEach(() => {
+        write('new.md', 'Untracked forbidden text.\n');
+        result = runStagedCheck({ base: 'main', cwd: repo, env });
+      });
+
+      it('should count every line of the file as added', () => {
+        expect(result.exitCode).toBe(1);
+        expect(result.report).toContain('new.md');
+        expect(result.notices).toEqual([expect.stringContaining('error-level alerts on added lines')]);
+      });
+    });
+
+    describe('when the branch changed no prose', () => {
+      let result;
+
+      beforeEach(() => {
+        sh(['checkout', '-q', 'main']);
+        result = runStagedCheck({ base: 'main', cwd: repo, env });
+      });
+
+      it('should pass with no report', () => {
+        expect(result).toEqual({ exitCode: 0, report: '', notices: [] });
+      });
+    });
+  });
+
+  describe('in staged mode', () => {
+    describe('when the staged content has an error', () => {
+      let result;
+
+      beforeEach(() => {
+        write('doc.md', '# Doc\n\nClean.\n\nA forbidden line the branch committed.\n\nStaged forbidden line.\n');
+        sh(['add', 'doc.md']);
+        // A later unstaged edit must not move the staged line numbers.
+        write('doc.md', 'Unstaged.\n# Doc\n\nClean.\n\nA forbidden line the branch committed.\n\nStaged forbidden line.\n');
+        result = runStagedCheck({ cwd: repo, env });
+      });
+
+      it('should fail on the staged line only', () => {
+        expect(result.exitCode).toBe(1);
+        expect(errorLines(result)).toEqual([7]);
+      });
+    });
   });
 });

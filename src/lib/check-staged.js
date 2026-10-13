@@ -247,14 +247,25 @@ export function runStagedCheck({ base = null, cwd = process.cwd(), env = process
   let tmp = null;
   try {
     let files, diffText, lintRoot, scope;
+    let untracked = [];
     if (base) {
+      // Vale lints the working tree here, so the diff must end at the
+      // working tree too. Ending it at HEAD gives HEAD's line numbers, and
+      // one uncommitted line above a committed error moves the error off
+      // its recorded line: the gate passes, and CI then fails the branch.
       const mergeBase = gitOrThrow(['merge-base', base, 'HEAD'], root).trim();
       const pathspec = ['--', ...PROSE_EXT.map((e) => `*${e}`)];
-      files = gitOrThrow(['diff', '--name-only', '--diff-filter=ACMR', mergeBase, 'HEAD', ...pathspec], root)
+      const tracked = gitOrThrow(['diff', '--name-only', '--diff-filter=ACMR', mergeBase, ...pathspec], root)
         .split('\n')
         .filter(Boolean);
+      // An untracked prose file is outside git's diff; every line of it is
+      // an addition the branch will make.
+      untracked = gitOrThrow(['ls-files', '--others', '--exclude-standard', ...pathspec], root)
+        .split('\n')
+        .filter(Boolean);
+      files = [...tracked, ...untracked];
       if (files.length === 0) return { exitCode: 0, report: '', notices: [] };
-      diffText = gitOrThrow(['diff', '-U0', mergeBase, 'HEAD', '--', ...extensionPathspec(files)], root);
+      diffText = gitOrThrow(['diff', '-U0', mergeBase, '--', ...extensionPathspec(files)], root);
       lintRoot = root;
       scope = `added lines since ${base}`;
     } else {
@@ -280,7 +291,9 @@ export function runStagedCheck({ base = null, cwd = process.cwd(), env = process
       if (left.length > 0) exempted.set(file, left);
     }
 
-    const { kept, unmapped } = selectAlerts(exempted, parseAddedLines(diffText), fileLevel);
+    const added = parseAddedLines(diffText);
+    for (const file of untracked) added.set(file, allLines(path.join(lintRoot, file)));
+    const { kept, unmapped } = selectAlerts(exempted, added, fileLevel);
     const { lines, totals } = renderReport(kept, scope, files.length);
     const notices = [];
     if (unmapped.length > 0) {
@@ -301,6 +314,13 @@ export function runStagedCheck({ base = null, cwd = process.cwd(), env = process
   } finally {
     if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
   }
+}
+
+// Every line number of a file, for a file git has no diff for. A trailing
+// newline counts one line too many, which no alert can land on.
+function allLines(file) {
+  const count = fs.readFileSync(file, 'utf8').split('\n').length;
+  return new Set(Array.from({ length: count }, (_, i) => i + 1));
 }
 
 // Alerts carry repo-relative paths; the exemption filter needs real line

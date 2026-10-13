@@ -79,7 +79,7 @@ node "<repo or plugin dir>/src/cli/check-staged.js" --base main  # CI: everythin
 
 **What it checks.** Markdown and HTML files: `.md`, `.mdx`, `.markdown`, `.html`, and `.htm`. Generated HTML such as a coverage report or a built docs site enters the gate too, so exempt those paths in `.vale.ini`. Within the checked files, only the lines you added. A file with old problems does not fail your commit when you touch one paragraph of it. The one exception is a rule that judges the whole document, such as a `metric` rule for sentence length or an `occurrence` rule with document-wide scope. Vale reports those at line 1, so the gate keeps them whenever the file changed at all.
 
-**Pre-commit mode** lints the staged content, so it sees exactly what will land. If you stage half of a file with `git add -p`, the gate checks that half and ignores the rest. **`--base` mode** lints the working tree and keeps the lines added since the merge-base with the ref you name. That gives CI the same check over a whole branch.
+**Pre-commit mode** lints the staged content, so it sees exactly what will land. If you stage half of a file with `git add -p`, the gate checks that half and ignores the rest. **`--base` mode** lints the working tree and keeps the lines added since the merge-base with the ref you name, uncommitted edits included. An untracked prose file counts as added in full. That gives CI the same check over a whole branch, and `--base HEAD` checks exactly the lines you have not committed yet.
 
 **Exit codes:**
 
